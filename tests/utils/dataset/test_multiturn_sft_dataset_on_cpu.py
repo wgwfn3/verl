@@ -236,6 +236,46 @@ def test_multiturn_sft_dataset(model_path: str, ignore_input_ids_mismatch: bool)
     print("Starting test...")
 
 
+@pytest.mark.parametrize("truncation", ["left", "right"])
+def test_multiturn_sft_dataset_no_padding_truncation_side(truncation: str):
+    """no_padding must honor the truncation side, keeping input_ids/loss_mask/position_ids aligned."""
+    model_path = f"{custom_model_prefix}/Qwen/Qwen2.5-0.5B"
+    test_data = {
+        "messages": [
+            [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "2+2 equals 4."},
+                {"role": "tool", "content": "And what is 4+4?"},
+                {"role": "assistant", "content": "4+4 equals 8."},
+            ],
+        ]
+    }
+    os.makedirs("test_data", exist_ok=True)
+    test_file = "test_data/test_no_padding_truncation.parquet"
+    pd.DataFrame(test_data).to_parquet(test_file)
+
+    tokenizer = hf_tokenizer(model_path)
+
+    def build(max_length: int, trunc: str) -> MultiTurnSFTDataset:
+        config = {
+            "max_length": max_length,
+            "truncation": trunc,
+            "multiturn": {"messages_key": "messages"},
+            "pad_mode": "no_padding",
+        }
+        return MultiTurnSFTDataset(parquet_files=test_file, tokenizer=tokenizer, processor=None, config=config)
+
+    full = build(4096, "error")[0]
+    max_length = len(full["input_ids"]) - 5
+    assert max_length > 0
+    item = build(max_length, truncation)[0]
+
+    sl = slice(-max_length, None) if truncation == "left" else slice(0, max_length)
+    assert torch.equal(item["input_ids"], full["input_ids"][sl])
+    assert torch.equal(item["loss_mask"], full["loss_mask"][sl])
+    assert torch.equal(item["position_ids"], full["position_ids"][..., sl])
+
+
 @pytest.mark.parametrize(
     "model_path, apply_chat_template_kwargs",
     [

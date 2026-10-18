@@ -406,9 +406,14 @@ class MultiTurnSFTDataset(Dataset):
                 raise ValueError(f"{sequence_length=} is larger than {self.max_length=}")
             # truncate input_ids if it is longer than max_length
             if len(input_ids) > self.max_length:
-                input_ids = input_ids[: self.max_length]
-                loss_mask = loss_mask[: self.max_length]
-                position_ids = position_ids[..., : self.max_length]
+                if self.truncation == "left":
+                    input_ids = input_ids[-self.max_length :]
+                    loss_mask = loss_mask[-self.max_length :]
+                    position_ids = position_ids[..., -self.max_length :]
+                else:
+                    input_ids = input_ids[: self.max_length]
+                    loss_mask = loss_mask[: self.max_length]
+                    position_ids = position_ids[..., : self.max_length]
 
             # return nested tensor with out padding
             res = {
