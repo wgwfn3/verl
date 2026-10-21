@@ -266,14 +266,41 @@ def test_multiturn_sft_dataset_no_padding_truncation_side(truncation: str):
         return MultiTurnSFTDataset(parquet_files=test_file, tokenizer=tokenizer, processor=None, config=config)
 
     full = build(4096, "error")[0]
-    max_length = len(full["input_ids"]) - 5
-    assert max_length > 0
+    full_mask = full["loss_mask"]
+    seq_len = len(full["input_ids"])
+
+    # Supervised spans, one per assistant turn.
+    idx = full_mask.nonzero().flatten().tolist()
+    spans, start = [], idx[0]
+    for a, b in zip(idx, idx[1:] + [None], strict=True):
+        if b != a + 1:
+            spans.append((start, a + 1))
+            start = b
+    assert len(spans) == 2, spans
+    (s0, e0), (s1, e1) = spans
+
+    # Cut through the middle of a supervised span: the first assistant turn for
+    # left truncation, the last one for right truncation.
+    cut = (s0 + e0) // 2 if truncation == "left" else (s1 + e1) // 2
+    max_length = seq_len - cut if truncation == "left" else cut
     item = build(max_length, truncation)[0]
 
     sl = slice(-max_length, None) if truncation == "left" else slice(0, max_length)
     assert torch.equal(item["input_ids"], full["input_ids"][sl])
-    assert torch.equal(item["loss_mask"], full["loss_mask"][sl])
+    assert torch.equal(item["loss_mask"], full_mask[sl])
     assert torch.equal(item["position_ids"], full["position_ids"][..., sl])
+
+    item_mask = item["loss_mask"]
+    assert item_mask.sum() < full_mask.sum()
+    if truncation == "left":
+        # The early assistant turn loses its head; the last one is kept whole.
+        assert item_mask[: e0 - cut].all()
+        assert item_mask[s1 - cut : e1 - cut].all()
+        assert item_mask.sum() == full_mask[s1:e1].sum() + (e0 - cut)
+    else:
+        # The first assistant turn is kept whole; the last one loses its tail.
+        assert item_mask[s0:e0].all()
+        assert item_mask.sum() == full_mask[s0:e0].sum() + (cut - s1)
 
 
 @pytest.mark.parametrize(
