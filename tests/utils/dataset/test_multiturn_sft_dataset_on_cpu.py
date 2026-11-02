@@ -236,6 +236,73 @@ def test_multiturn_sft_dataset(model_path: str, ignore_input_ids_mismatch: bool)
     print("Starting test...")
 
 
+@pytest.mark.parametrize("truncation", ["left", "right"])
+def test_multiturn_sft_dataset_no_padding_truncation_side(truncation: str):
+    """no_padding must honor the truncation side, keeping input_ids/loss_mask/position_ids aligned."""
+    model_path = f"{custom_model_prefix}/Qwen/Qwen2.5-0.5B"
+    test_data = {
+        "messages": [
+            [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "2+2 equals 4."},
+                {"role": "tool", "content": "And what is 4+4?"},
+                {"role": "assistant", "content": "4+4 equals 8."},
+            ],
+        ]
+    }
+    os.makedirs("test_data", exist_ok=True)
+    test_file = "test_data/test_no_padding_truncation.parquet"
+    pd.DataFrame(test_data).to_parquet(test_file)
+
+    tokenizer = hf_tokenizer(model_path)
+
+    def build(max_length: int, trunc: str) -> MultiTurnSFTDataset:
+        config = {
+            "max_length": max_length,
+            "truncation": trunc,
+            "multiturn": {"messages_key": "messages"},
+            "pad_mode": "no_padding",
+        }
+        return MultiTurnSFTDataset(parquet_files=test_file, tokenizer=tokenizer, processor=None, config=config)
+
+    full = build(4096, "error")[0]
+    full_mask = full["loss_mask"]
+    seq_len = len(full["input_ids"])
+
+    # Supervised spans, one per assistant turn.
+    idx = full_mask.nonzero().flatten().tolist()
+    spans, start = [], idx[0]
+    for a, b in zip(idx, idx[1:] + [None], strict=True):
+        if b != a + 1:
+            spans.append((start, a + 1))
+            start = b
+    assert len(spans) == 2, spans
+    (s0, e0), (s1, e1) = spans
+
+    # Cut through the middle of a supervised span: the first assistant turn for
+    # left truncation, the last one for right truncation.
+    cut = (s0 + e0) // 2 if truncation == "left" else (s1 + e1) // 2
+    max_length = seq_len - cut if truncation == "left" else cut
+    item = build(max_length, truncation)[0]
+
+    sl = slice(-max_length, None) if truncation == "left" else slice(0, max_length)
+    assert torch.equal(item["input_ids"], full["input_ids"][sl])
+    assert torch.equal(item["loss_mask"], full_mask[sl])
+    assert torch.equal(item["position_ids"], full["position_ids"][..., sl])
+
+    item_mask = item["loss_mask"]
+    assert item_mask.sum() < full_mask.sum()
+    if truncation == "left":
+        # The early assistant turn loses its head; the last one is kept whole.
+        assert item_mask[: e0 - cut].all()
+        assert item_mask[s1 - cut : e1 - cut].all()
+        assert item_mask.sum() == full_mask[s1:e1].sum() + (e0 - cut)
+    else:
+        # The first assistant turn is kept whole; the last one loses its tail.
+        assert item_mask[s0:e0].all()
+        assert item_mask.sum() == full_mask[s0:e0].sum() + (cut - s1)
+
+
 @pytest.mark.parametrize(
     "model_path, apply_chat_template_kwargs",
     [
